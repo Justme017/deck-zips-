@@ -1,0 +1,267 @@
+"""Rotary Deck V2.2 time/media/actual-volume bridge (test candidate). Run on Windows as a normal user.
+Uses paired-device enumeration (not scanning) so existing Windows HID connection
+can share the device's custom GATT service. No shell commands or app launching.
+"""
+import argparse
+import asyncio
+import datetime as dt
+import logging
+import struct
+import sys
+import time
+import unicodedata
+import uuid
+from pathlib import Path
+
+# Initialise COM-based audio access in MTA before comtypes is imported.
+sys.coinit_flags = 0
+
+SERVICE_UUID = uuid.UUID("917e0001-d588-4b6b-a9a0-a81a964ce2b1")
+RX_UUID = uuid.UUID("917e0002-d588-4b6b-a9a0-a81a964ce2b1")
+
+
+def time_packet(sequence, timestamp=None, offset_minutes=None):
+    if timestamp is None:
+        timestamp = int(time.time())
+    if offset_minutes is None:
+        offset_minutes = int(dt.datetime.now().astimezone().utcoffset().total_seconds() / 60)
+    return struct.pack("<BBIh", 1, sequence & 255, timestamp, offset_minutes)
+
+
+def title_packets(sequence, title):
+    text = unicodedata.normalize("NFKD", title or "")
+    text = "".join(ch for ch in text if not unicodedata.combining(ch))
+    text = " ".join(text.split()).encode("ascii", "replace")[:128]
+    count = max(1, (len(text) + 15) // 16)
+    return [bytes((2, sequence & 255, i, count)) + text[i * 16:(i + 1) * 16] for i in range(count)]
+
+
+def state_packet(sequence, playback, session):
+    return bytes((3, sequence & 255, playback, session))
+
+
+
+def volume_packet(sequence, percent, muted=False):
+    if percent is None:
+        percent = 255
+    if not (0 <= percent <= 100 or percent == 255):
+        raise ValueError("Volume must be 0..100, or None for unavailable")
+    return bytes((4, sequence & 255, int(percent), int(bool(muted))))
+
+
+def read_volume():
+    from pycaw.pycaw import AudioUtilities, IAudioEndpointVolume
+    device = AudioUtilities.GetSpeakers()
+    if device is None:
+        raise RuntimeError("No default audio output device")
+    try:
+        endpoint = device.EndpointVolume
+    except AttributeError:
+        # Compatibility with older Pycaw versions.
+        from ctypes import cast, POINTER
+        from comtypes import CLSCTX_ALL
+        interface = device.Activate(IAudioEndpointVolume._iid_, CLSCTX_ALL, None)
+        endpoint = cast(interface, POINTER(IAudioEndpointVolume))
+    percent = round(float(endpoint.GetMasterVolumeLevelScalar()) * 100)
+    return max(0, min(100, percent)), bool(endpoint.GetMute()), device.FriendlyName
+
+
+def diagnose():
+    import importlib
+    import platform
+    logging.info("Python %s (%s); executable: %s", platform.python_version(), platform.machine(), sys.executable)
+    modules = ["winrt.windows.foundation", "winrt.windows.foundation.collections",
+               "winrt.windows.devices.bluetooth", "winrt.windows.devices.enumeration",
+               "winrt.windows.devices.bluetooth.genericattributeprofile",
+               "winrt.windows.storage.streams", "winrt.windows.media.control", "pycaw.pycaw"]
+    ok = True
+    for name in modules:
+        try:
+            importlib.import_module(name)
+            logging.info("Dependency OK: %s", name)
+        except Exception:
+            logging.exception("Dependency FAILED: %s", name)
+            ok = False
+    if ok:
+        try:
+            percent, muted, name = read_volume()
+            logging.info("Audio OK: %s; volume=%s%%; muted=%s", name, percent, muted)
+        except Exception:
+            logging.exception("Audio FAILED (Bluetooth not yet tested)")
+            ok = False
+    return ok
+
+
+async def enumerate_devices(args):
+    from winrt.windows.devices.bluetooth import BluetoothLEDevice
+    from winrt.windows.devices.enumeration import DeviceInformation
+    logging.info("Enumerating paired BLE devices...")
+    selector = BluetoothLEDevice.get_device_selector_from_pairing_state(True)
+    devices = await asyncio.wait_for(DeviceInformation.find_all_async(selector), 20)
+    if args.list:
+        for device in devices:
+            print(f"{device.name}\n  {device.id}")
+        return None
+    logging.info("Paired BLE devices: %s", ", ".join(d.name for d in devices) or "none")
+    matches = [d for d in devices if (d.id == args.device_id if args.device_id else d.name.casefold() == args.device_name.casefold())]
+    if not matches:
+        raise RuntimeError("No matching paired deck. Pair Rotary Deck in Windows Bluetooth settings first. Use --list to inspect names.")
+    if len(matches) > 1:
+        raise RuntimeError("More than one matching device. Use --list, then --device-id to choose explicitly.")
+    return matches[0]
+
+
+async def open_receiver(info):
+    from winrt.windows.devices.bluetooth import BluetoothLEDevice, BluetoothCacheMode
+    from winrt.windows.devices.bluetooth.genericattributeprofile import GattCommunicationStatus
+    device = None
+    service = None
+    try:
+        device = await asyncio.wait_for(BluetoothLEDevice.from_id_async(info.id), 20)
+        if device is None:
+            raise RuntimeError("Windows could not open the paired deck. Check Bluetooth and device-access permissions.")
+        logging.info("Discovering sync service %s", SERVICE_UUID)
+        result = await asyncio.wait_for(device.get_gatt_services_for_uuid_async(SERVICE_UUID, BluetoothCacheMode.UNCACHED), 20)
+        if result.status != GattCommunicationStatus.SUCCESS or len(result.services) != 1:
+            raise RuntimeError(f"Sync service unavailable ({result.status}). Flash V2.1; if upgrading from V2.0, remove/re-pair the deck to clear stale GATT cache.")
+        service = result.services[0]
+        chars = await asyncio.wait_for(service.get_characteristics_for_uuid_async(RX_UUID, BluetoothCacheMode.UNCACHED), 20)
+        if chars.status != GattCommunicationStatus.SUCCESS or len(chars.characteristics) != 1:
+            raise RuntimeError(f"Sync characteristic unavailable ({chars.status}).")
+        logging.info("Sync receiver found. Starting acknowledged writes.")
+        return device, service, chars.characteristics[0]
+    except Exception:
+        if service is not None:
+            service.close()
+        if device is not None:
+            device.close()
+        raise
+
+
+async def write_packet(characteristic, payload):
+    from winrt.windows.storage.streams import DataWriter
+    from winrt.windows.devices.bluetooth.genericattributeprofile import GattWriteOption, GattCommunicationStatus
+    if len(payload) > 20:
+        raise ValueError("Protocol packets must fit the default 20-byte ATT payload.")
+    writer = DataWriter()
+    writer.write_bytes(payload)
+    buffer = writer.detach_buffer()
+    writer.close()
+    result = await asyncio.wait_for(characteristic.write_value_with_result_async(buffer, GattWriteOption.WRITE_WITH_RESPONSE), 10)
+    if result.status != GattCommunicationStatus.SUCCESS:
+        raise RuntimeError(f"GATT write failed: {result.status}; check pairing/encryption and proximity.")
+    await asyncio.sleep(0.025)
+
+
+async def media_snapshot(manager):
+    from winrt.windows.media.control import GlobalSystemMediaTransportControlsSessionPlaybackStatus as Status
+    session = manager.get_current_session()
+    if session is None:
+        return 0, 0, ""
+    props = await asyncio.wait_for(session.try_get_media_properties_async(), 5)
+    status = session.get_playback_info().playback_status
+    playback = 1 if status == Status.PLAYING else 2 if status == Status.PAUSED else 3 if status == Status.STOPPED else 0
+    return playback, 1, props.title or ""
+
+
+async def stream(characteristic):
+    from winrt.windows.media.control import GlobalSystemMediaTransportControlsSessionManager
+    manager = None
+    last_time = last_media = last_audio_error = last_media_error = -100.0
+    sequence = 0
+    last_title = None
+    last_audio = None
+    logging.info("Sync active: volume ~0.5s, media ~2s, clock ~5s; Ctrl+C to exit.")
+    while True:
+        tick = time.monotonic()
+        # Isolate audio failures: time/media sync should still work.
+        try:
+            percent, muted, endpoint_name = read_volume()
+            audio = (percent, muted, endpoint_name)
+        except Exception:
+            percent, muted = None, False
+            audio = None
+            if tick - last_audio_error >= 30:
+                logging.exception("Cannot read Windows default output volume")
+                last_audio_error = tick
+        await write_packet(characteristic, volume_packet(sequence, percent, muted))
+        if audio != last_audio:
+            logging.info("Volume: %s", f"{percent}% muted={muted} output={endpoint_name}" if audio else "unavailable")
+            last_audio = audio
+        if tick - last_time >= 5:
+            await write_packet(characteristic, time_packet(sequence))
+            last_time = tick
+        if tick - last_media >= 2:
+            try:
+                if manager is None:
+                    manager = await asyncio.wait_for(GlobalSystemMediaTransportControlsSessionManager.request_async(), 5)
+                playback, session, title = await media_snapshot(manager)
+            except Exception:
+                playback, session, title = 0, 2, ""
+                manager = None
+                if tick - last_media_error >= 30:
+                    logging.exception("Media metadata unavailable; volume/time sync can continue")
+                    last_media_error = tick
+            await write_packet(characteristic, state_packet(sequence, playback, session))
+            for packet in title_packets(sequence, title):
+                await write_packet(characteristic, packet)
+            if title != last_title:
+                logging.info("Media: %s", title or ("no session" if session == 0 else "title unavailable"))
+                last_title = title
+            last_media = time.monotonic()
+        sequence = (sequence + 1) & 255
+        await asyncio.sleep(max(0.05, 0.5 - (time.monotonic() - tick)))
+
+
+async def run(args):
+    if args.diagnose:
+        if not diagnose():
+            raise SystemExit(1)
+        await enumerate_devices(argparse.Namespace(list=True))
+        return
+    if args.list:
+        await enumerate_devices(args)
+        return
+    while True:
+        device = service = None
+        try:
+            info = await enumerate_devices(args)
+            logging.info("Opening paired device: %s", info.name)
+            device, service, characteristic = await open_receiver(info)
+            await stream(characteristic)
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:
+            logging.exception("Sync failed; retrying in 5 seconds")
+        finally:
+            if service is not None:
+                service.close()
+            if device is not None:
+                device.close()
+        await asyncio.sleep(5)
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--diagnose", action="store_true", help="Check dependencies, audio and paired-device enumeration; no GATT writes.")
+    parser.add_argument("--device-name", default="Rotary Deck")
+    parser.add_argument("--device-id", default=None)
+    parser.add_argument("--list", action="store_true", help="List paired BLE devices and their Windows IDs.")
+    args = parser.parse_args()
+    if sys.platform != "win32":
+        parser.error("This companion uses Windows Runtime APIs and runs on Windows only.")
+    handlers = [logging.StreamHandler()]
+    try:
+        handlers.append(logging.FileHandler(Path(__file__).with_name("rotary_deck_sync.log"), encoding="utf-8"))
+    except OSError:
+        pass
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s", handlers=handlers)
+    logging.info("Rotary Deck v2.2 companion: %s", sys.executable)
+    try:
+        asyncio.run(run(args))
+    except KeyboardInterrupt:
+        print("\nCompanion stopped. HID controls remain independent.")
+
+
+if __name__ == "__main__":
+    main()

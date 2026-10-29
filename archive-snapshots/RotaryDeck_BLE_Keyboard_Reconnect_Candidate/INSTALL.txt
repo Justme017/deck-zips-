@@ -1,0 +1,33 @@
+# RotaryDeck HID reconnect candidate for the supplied ESP32 BLE Keyboard 0.3.0
+
+This is a local patch of your installed library, not an official T-vK release and not a guaranteed diagnosis/fix. Applies to your current Arduino-ESP32 2.0.17 Bluedroid setup. Do not switch to NimBLE as part of this test.
+
+## Install
+1. Stop the PC companion and close Arduino IDE.
+2. Back up the installed BLE Keyboard library folder OUTSIDE your Arduino libraries folder, so Arduino does not detect a duplicate copy.
+3. In the original library folder, replace BleKeyboard.cpp with this package's file. The included BleKeyboard.h is byte-for-byte your uploaded header, supplied under its canonical name; replacing it is optional.
+4. Do NOT put these library files in the RotaryDeck sketch folder.
+5. Reopen the RotaryDeck sketch, Verify, then Upload. This rebuild/upload is necessary: replacing a PC library file alone cannot update the ESP32.
+6. Check compilation output identifies the intended installed library folder. library.properties still says 0.3.0; the source patch does not change the advertised upstream version.
+
+## Changes
+- On connect: clear local key/media report state, restore keyboard and media BLE2902 notification flags on the non-NimBLE backend, then mark connected.
+- On disconnect: clear local report state, disable both notification flags and restart advertising with a null guard.
+- releaseAll: sends the media release report as well as the keyboard release report.
+- Keeps the existing report map, pairing/security configuration, onStarted hook, and public API.
+- Does not change firmware UI, clock, date, volume protocol, UUIDs or companion.
+
+## Test without changing pairing first
+1. With companion stopped, test volume, mute, play/pause immediately after upload.
+2. Unplug/replug power, wait 10 seconds and repeat; perform three cycles.
+3. Start the companion and repeat the same power-cycle tests.
+4. Test keyboard shortcuts too. Do not claim success from COMMAND SENT alone; check Windows actually responds.
+
+## Limits
+Restoring the local notification flag does not itself prove Windows has restored its HID session or accepted a report. If it still fails, report whether companion was stopped/running and whether all HID buttons fail or only media buttons. Further security/subscription diagnostics may be needed. Do not erase flash or unpair other devices.
+
+## Rollback
+Restore the backed-up BleKeyboard.cpp (and header if replaced), then rebuild and upload your sketch.
+
+## Validation
+The modified callback/releaseAll logic can be host-tested with mock descriptors, including absent descriptors and reconnect cycles. This is not a complete Arduino/ESP32 library build or a Windows hardware test. No GitHub changes made.

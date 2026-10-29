@@ -1,0 +1,1 @@
+Source checks: balanced braces/parentheses in both C++ files; quadrature sequence models passed (forward, reverse, contact bounce). These are NOT compilation or hardware tests.
