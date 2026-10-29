@@ -1,0 +1,11 @@
+# Complete v2.2 dashboard/date headers
+
+Back up your working sketch. Close Arduino IDE. Replace ONLY DeckCore.h and DisplayUI.h in the active RotaryDeck_v2_1 sketch folder with the two headers supplied here. Reopen the same .ino, Verify, and Upload. Do not overwrite your working companion or its overload fixes.
+
+Included: compact hour/minute/second group, right-side weekday and date, AM/PM in 12-hour mode or year in 24-hour mode; saved Settings > Display > CLOCK toggle; volume telemetry receiver/UI; uploaded carousel, centred dots, filled speakers and Media spacing.
+
+Local date uses the same UTC plus companion-supplied offset as the clock. No date or clock is invented before valid time sync. Clock and date continue advancing from the last accepted time while powered; PC/-- remains the freshness indicator. A full loss of power requires a fresh time packet before time/date are valid again.
+
+This package does NOT claim to fix HID reconnection. It does not change the BLE library, bonds, UUIDs or companion. The T-vK library version actually installed needs inspection, plus a power-cycle test with the companion stopped, before selecting a reconnect fix. Do not erase all flash or delete bonds as part of installing these UI headers.
+
+Validation: UI host compile/run uses mocked hardware interfaces, not the real Arduino/U8g2 libraries. Full ESP32 compilation, LCD spacing and reboot persistence must be verified on-device. No GitHub changes made.

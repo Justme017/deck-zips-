@@ -1,0 +1,16 @@
+# RotaryDeck 12/24-hour clock option (v2.2 firmware add-on)
+
+## Install
+Back up your working firmware folder. Close Arduino IDE. Replace ONLY DeckCore.h and DisplayUI.h in your working RotaryDeck_v2_1 sketch folder with the two files in this ZIP. Reopen the same .ino, Verify, and Upload.
+
+Do NOT overwrite the companion folder or undo its enumeration/GATT fixes. No Python changes, library changes, or pairing reset are needed for this feature.
+
+## Use
+Open Menu > Settings > Display. Scroll down to CLOCK: 24H. Press to toggle to CLOCK: 12H; press again for 24H. The choice saves immediately using a new hour12 preference key. New installations default to 24H; existing other preference keys are unchanged.
+
+12H dashboard: big hour/minute, small AM/PM above seconds on the right. 24H dashboard: existing clock layout. Midnight is 12:00 AM; noon is 12:00 PM. PC time packets and timezone interpretation are unchanged.
+
+The existing three-row scrolling list now has four Display entries. Your current carousel, centred dots, solid speaker icons, Media spacing and volume-sync receiver/UI are retained from the files supplied in this conversation and the preceding volume update.
+
+## Validation
+Check conversion for all 24 hours; midnight, noon, afternoon and late evening; change format then restart to confirm persistence. The packaged code has not been built with the ESP32 toolchain or tested on a physical LCD. Back up before installation. No GitHub commit/release has been made.
